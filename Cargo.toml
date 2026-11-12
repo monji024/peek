@@ -1,0 +1,30 @@
+# https://github.com/monji024
+
+[package]
+name = "bash-peek"
+version = "1.0.0"
+edition = "2021"
+authors = ["monji024 <https://github.com/monji024>"]
+description = "Interactive TUI debugger, line profiler, and time-travel inspector for Bash scripts"
+repository = "https://github.com/monji024/peek"
+license = "MIT"
+readme = "README.md"
+keywords = ["bash", "debugger", "tui", "profiler", "shell"]
+categories = ["command-line-utilities", "development-tools::debugging", "development-tools::profiling"]
+
+[[bin]]
+name = "peek"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+libc = "0.2"
+ratatui = "0.28"
+tempfile = "3.12"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
