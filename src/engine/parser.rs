@@ -16,12 +16,16 @@ const INTERNAL_VARS: &[&str] = &[
     "OPTIND", "OSTYPE", "PATH", "PIPESTATUS", "PPID", "PS1", "PS2", "PS4",
     "PWD", "RANDOM", "SECONDS", "SHELL", "SHELLOPTS", "SHLVL", "SRANDOM",
     "TERM", "UID", "_", "LS_COLORS", "XDG_DATA_DIRS", "XDG_CONFIG_DIRS",
-    "DBUS_SESSION_BUS_ADDRESS",
+    "DBUS_SESSION_BUS_ADDRESS", "BASH_ENV",
 ];
+
+const MAX_VAR_VALUE_BYTES: usize = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct RawFrame {
     pub is_sync: bool,
+    pub pid: u32,
+    pub ppid: u32,
     pub file: PathBuf,
     pub line: usize,
     pub exit_code: i32,
@@ -53,7 +57,7 @@ pub fn parse_frame<R: BufRead>(
     reader: &mut R,
     nonce: &str,
 ) -> io::Result<Option<RawFrame>> {
-    let mut parts = header.splitn(6, '\t');
+    let mut parts = header.splitn(8, '\t');
     let is_sync = match parts.next() {
         Some("STOP") => false,
         Some("SYNC") => true,
@@ -70,6 +74,8 @@ pub fn parse_frame<R: BufRead>(
         .split_whitespace()
         .filter_map(|s| s.parse::<i32>().ok())
         .collect();
+    let pid = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let ppid = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let vars_begin_marker = format!("__PEEK_VARS_{}__", nonce);
     let frame_end_marker = format!("__PEEK_END_{}__", nonce);
@@ -112,6 +118,8 @@ pub fn parse_frame<R: BufRead>(
 
     Ok(Some(RawFrame {
         is_sync,
+        pid,
+        ppid,
         file,
         line,
         exit_code,
@@ -148,6 +156,7 @@ pub fn parse_declare_block(lines: &[String]) -> BTreeMap<String, (VarKind, Strin
     }
     map
 }
+
 fn is_ignored_var(name: &str) -> bool {
     name == "LINENO"
         || name == "FUNCNAME"
@@ -190,22 +199,122 @@ fn parse_single_declare(line: &str) -> Option<(String, VarKind, String)> {
         return None;
     }
 
-    let clean = unquote_bash_value(raw_val);
+    let mut clean = unquote_bash_value(raw_val);
+    if clean.len() > MAX_VAR_VALUE_BYTES {
+        let mut trunc = MAX_VAR_VALUE_BYTES;
+        while !clean.is_char_boundary(trunc) && trunc > 0 {
+            trunc -= 1;
+        }
+        clean.truncate(trunc);
+        clean.push_str("... [truncated]");
+    }
     Some((name.to_string(), kind, clean))
 }
 
-fn unquote_bash_value(raw: &str) -> String {
+pub fn unquote_bash_value(raw: &str) -> String {
     if let Some(inner) = raw.strip_prefix("$'").and_then(|s| s.strip_suffix('\'')) {
-        return inner.to_string();
+        return unescape_ansi_c_string(inner);
     }
     if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        return inner
-            .replace("\\\"", "\"")
-            .replace("\\\\", "\\")
-            .replace("\\$", "$")
-            .replace("\\`", "`");
+        return unescape_double_quoted_string(inner);
     }
     raw.to_string()
+}
+
+fn unescape_double_quoted_string(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek().copied() {
+                Some('"' | '\\' | '$' | '`') => {
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                }
+                Some('\n') => {
+                    chars.next();
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn unescape_ansi_c_string(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(esc) = chars.next() else {
+            out.push('\\');
+            break;
+        };
+        match esc {
+            'a' => out.push('\x07'),
+            'b' => out.push('\x08'),
+            'e' | 'E' => out.push('\x1b'),
+            'f' => out.push('\x0c'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'v' => out.push('\x0b'),
+            '\\' => out.push('\\'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
+            '?' => out.push('?'),
+            'x' => {
+                let mut hex = String::new();
+                for _ in 0..2 {
+                    if let Some(&hc) = chars.peek() {
+                        if hc.is_ascii_hexdigit() {
+                            hex.push(hc);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    out.push(byte as char);
+                } else {
+                    out.push_str("\\x");
+                    out.push_str(&hex);
+                }
+            }
+            d if ('0'..='7').contains(&d) => {
+                let mut oct = String::new();
+                oct.push(d);
+                for _ in 0..2 {
+                    if let Some(&oc) = chars.peek() {
+                        if ('0'..='7').contains(&oc) {
+                            oct.push(oc);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if let Ok(byte) = u8::from_str_radix(&oct, 8) {
+                    out.push(byte as char);
+                } else {
+                    out.push('\\');
+                    out.push_str(&oct);
+                }
+            }
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -221,17 +330,31 @@ mod tests {
             r#"declare -- BODY="{"#.to_string(),
             r#"  \"ok\": true"#.to_string(),
             r#"}""#.to_string(),
+            r#"declare -- MULTI=$'line1\nline2\ttab\x21'"#.to_string(),
             r#"declare -- __PEEK_NONCE="deadbeef""#.to_string(),
         ];
 
         let parsed = parse_declare_block(&dump);
-        assert_eq!(parsed.get("TARGET_HOST"), Some(&(VarKind::Scalar, "10.0.0.1".into())));
+        assert_eq!(
+            parsed.get("TARGET_HOST"),
+            Some(&(VarKind::Scalar, "10.0.0.1".into()))
+        );
         assert_eq!(parsed.get("PORT"), Some(&(VarKind::Integer, "8080".into())));
         assert_eq!(parsed.get("SERVERS").map(|x| &x.0), Some(&VarKind::Array));
         assert_eq!(
             parsed.get("BODY"),
             Some(&(VarKind::Scalar, "{\n  \"ok\": true\n}".into()))
         );
+        assert_eq!(
+            parsed.get("MULTI"),
+            Some(&(VarKind::Scalar, "line1\nline2\ttab!".into()))
+        );
         assert!(!parsed.contains_key("__PEEK_NONCE"));
+    }
+
+    #[test]
+    fn unquotes_escaped_backslashes_and_quotes_single_pass() {
+        let raw = r#""path\\to\\\"file\"""#;
+        assert_eq!(unquote_bash_value(raw), r#"path\to\"file""#);
     }
 }
