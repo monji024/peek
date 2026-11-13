@@ -483,6 +483,74 @@ echo "should not reach"
     assert "should not reach" not in out
 
 
+def test_orphaned_bootstrap_exits_on_host_fifo_close():
+    with tempfile.TemporaryDirectory(dir=WORK_DIR) as tmp:
+        state_fifo = os.path.join(tmp, "state.fifo")
+        cmd_fifo = os.path.join(tmp, "cmd.fifo")
+        lock_file = os.path.join(tmp, "subshell.lock")
+        boot_path = os.path.join(tmp, "bootstrap.sh")
+        script_path = os.path.join(tmp, "orphan.sh")
+
+        os.mkfifo(state_fifo, 0o600)
+        os.mkfifo(cmd_fifo, 0o600)
+        open(lock_file, "w").close()
+        with open(BOOTSTRAP_SRC, "r", encoding="utf-8") as f:
+            with open(boot_path, "w", encoding="utf-8") as out:
+                out.write(f.read())
+
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write("#!/usr/bin/env bash\nA=1\necho \"unreachable\"\n")
+        os.chmod(script_path, 0o755)
+
+        state_fd = os.open(state_fifo, os.O_RDWR | os.O_NONBLOCK)
+        cmd_fd = os.open(cmd_fifo, os.O_RDWR)
+
+        nonce = "deadbeefcafe1234"
+        env = os.environ.copy()
+        env.update(
+            {
+                "PEEK_STATE_FIFO": state_fifo,
+                "PEEK_CMD_FIFO": cmd_fifo,
+                "PEEK_LOCK_FILE": lock_file,
+                "PEEK_BOOTSTRAP": boot_path,
+                "PEEK_TARGET": script_path,
+                "PEEK_SESSION_DIR": tmp,
+                "PEEK_INIT_BPS": "",
+                "PEEK_INIT_ERR_TRAP": "0",
+                "PEEK_INIT_COND": "",
+                "PEEK_NONCE": nonce,
+            }
+        )
+
+        proc = subprocess.Popen(
+            ["bash", boot_path],
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        end_marker = f"__PEEK_END_{nonce}__\n".encode()
+        buf = b""
+        while end_marker not in buf:
+            r, _, _ = select.select([state_fd], [], [], 2.0)
+            if not r:
+                proc.kill()
+                raise RuntimeError("Timed out waiting for initial STOP frame")
+            buf += os.read(state_fd, 65536)
+
+        # Simulate the peek host process dying unexpectedly without sending ABORT:
+        # close the host's cmd_fifo write descriptor. Because bootstrap.sh opens
+        # cmd.fifo O_RDONLY (<), it immediately receives EOF and exits with 130
+        # instead of hanging forever in anon_pipe_read.
+        os.close(cmd_fd)
+        out, err = proc.communicate(timeout=2.0)
+        os.close(state_fd)
+        assert proc.returncode == 130, f"Expected exit 130 on host FIFO EOF, got {proc.returncode}"
+        assert "unreachable" not in out
+
+
 def main():
     tests = [
         ("Simple scripts & arguments", test_simple_script_and_args),
@@ -500,6 +568,7 @@ def main():
         ("Breakpoints & error traps", test_breakpoints_and_error_trap),
         ("Multiple concurrent Bash processes", test_multiple_concurrent_processes),
         ("Session abort & termination", test_session_disconnect_and_abort),
+        ("Orphaned bootstrap EOF termination (anon_pipe_read fix)", test_orphaned_bootstrap_exits_on_host_fifo_close),
     ]
 
     for label, fn in tests:

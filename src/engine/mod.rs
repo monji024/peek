@@ -71,7 +71,6 @@ pub enum EngineEvent {
 
 pub struct Session {
     _temp_dir: TempDir,
-    session_dir: PathBuf,
     child: Child,
     child_stdin: Option<ChildStdin>,
     cmd_fifo: File,
@@ -130,6 +129,14 @@ impl Session {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
 
         let mut child = cmd.spawn().context("failed to spawn bash process")?;
         let child_stdin = child.stdin.take();
@@ -198,7 +205,6 @@ impl Session {
 
         Ok(Self {
             _temp_dir: temp_dir,
-            session_dir,
             child,
             child_stdin,
             cmd_fifo,
@@ -208,10 +214,6 @@ impl Session {
 
     pub fn pid(&self) -> u32 {
         self.child.id()
-    }
-
-    pub fn session_dir(&self) -> &Path {
-        &self.session_dir
     }
 
     pub fn try_recv(&self) -> Option<EngineEvent> {
@@ -279,6 +281,7 @@ impl Session {
         let pgid = self.child.id() as i32;
         if pgid > 0 {
             unsafe {
+                libc::kill(-pgid, libc::SIGTERM);
                 libc::kill(-pgid, libc::SIGKILL);
             }
         }
@@ -304,7 +307,7 @@ impl Drop for Session {
     }
 }
 
-pub fn create_fifo(path: &Path) -> Result<()> {
+fn create_fifo(path: &Path) -> Result<()> {
     let c_path = CString::new(path.as_os_str().as_bytes())?;
     let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
     if rc != 0 {
@@ -322,7 +325,7 @@ fn tune_pipe_capacity(fd: i32) {
     let _ = fd;
 }
 
-pub fn generate_session_nonce() -> String {
+fn generate_session_nonce() -> String {
     let mut bytes = [0u8; 8];
     if let Ok(mut f) = File::open("/dev/urandom") {
         if f.read_exact(&mut bytes).is_ok() {
@@ -336,7 +339,7 @@ pub fn generate_session_nonce() -> String {
     format!("{:016x}", nanos ^ (std::process::id() as u64))
 }
 
-pub fn format_bp_list(bps: &[(PathBuf, usize)]) -> String {
+fn format_bp_list(bps: &[(PathBuf, usize)]) -> String {
     bps.iter()
         .map(|(file, line)| format!("{}:{}", file.display(), line))
         .collect::<Vec<_>>()

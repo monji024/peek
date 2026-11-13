@@ -6,6 +6,7 @@ use std::io::BufReader;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,11 +19,48 @@ use crate::protocol::{
     ProcessStatus, ServerMessage, PROTOCOL_VERSION,
 };
 
+static SERVER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_server_signal(_sig: libc::c_int) {
+    SERVER_SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+fn install_server_signal_handlers() {
+    SERVER_SHUTDOWN.store(false, Ordering::SeqCst);
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_server_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            handle_server_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGHUP,
+            handle_server_signal as *const () as libc::sighandler_t,
+        );
+    }
+}
+
 pub struct SessionSummary {
     pub session_id: String,
     pub socket_path: PathBuf,
+    pub host_pid: u32,
     pub root_pid: u32,
     pub entry_script: String,
+}
+
+struct SessionFileGuard {
+    sock_path: PathBuf,
+    meta_path: PathBuf,
+}
+
+impl Drop for SessionFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.sock_path);
+        let _ = fs::remove_file(&self.meta_path);
+    }
 }
 
 pub fn user_session_root() -> Result<PathBuf> {
@@ -42,6 +80,79 @@ pub fn user_session_root() -> Result<PathBuf> {
     Ok(base)
 }
 
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", pid)) {
+            if let Some(rparen) = stat.rfind(')') {
+                let after = stat[rparen + 1..].trim_start();
+                if after.starts_with('Z') || after.starts_with('X') {
+                    return false;
+                }
+            }
+        }
+    }
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+fn read_proc_ppid(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+        let rparen = stat.rfind(')')?;
+        let fields: Vec<&str> = stat[rparen + 1..].split_whitespace().collect();
+        if fields.len() >= 2 {
+            return fields[1].parse().ok();
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn is_session_valid(host_pid: u32, child_pid: u32, sock_path: &Path) -> bool {
+    if !sock_path.exists() || !is_pid_alive( child_pid ) {
+        return false;
+    }
+    if host_pid > 0 && !is_pid_alive(host_pid) {
+        return false;
+    }
+    if let Some(ppid) = read_proc_ppid(child_pid) {
+        if ppid == 1 {
+            return false;
+        }
+        if host_pid > 0 && ppid != host_pid {
+            return false;
+        }
+    }
+    true
+}
+
+fn reap_orphaned_child(child_pid: u32, host_pid: u32) {
+    if child_pid == 0 || !is_pid_alive(child_pid) {
+        return;
+    }
+    let orphaned = match read_proc_ppid(child_pid) {
+        Some(1) => true,
+        Some(ppid) if host_pid > 0 && ppid != host_pid && !is_pid_alive(host_pid) => true,
+        _ => host_pid > 0 && !is_pid_alive(host_pid),
+    };
+    if orphaned {
+        unsafe {
+            libc::kill(-(child_pid as i32), libc::SIGTERM);
+            libc::kill(child_pid as i32, libc::SIGTERM);
+            libc::kill(-(child_pid as i32), libc::SIGKILL);
+            libc::kill(child_pid as i32, libc::SIGKILL);
+        }
+    }
+}
+
 pub fn cleanup_stale_sessions() -> Result<usize> {
     let root = user_session_root()?;
     let mut removed = 0usize;
@@ -57,17 +168,28 @@ pub fn cleanup_stale_sessions() -> Result<usize> {
         let Ok(content) = fs::read_to_string(&path) else {
             continue;
         };
-        let mut pid: u32 = 0;
+        let mut host_pid: u32 = 0;
+        let mut child_pid: u32 = 0;
         let mut sock_path: Option<PathBuf> = None;
         for line in content.lines() {
-            if let Some(p) = line.strip_prefix("PID=") {
-                pid = p.parse().unwrap_or(0);
+            if let Some(p) = line.strip_prefix("HOST_PID=") {
+                host_pid = p.parse().unwrap_or(0);
+            } else if let Some(p) = line.strip_prefix("CHILD_PID=") {
+                child_pid = p.parse().unwrap_or(0);
+            } else if let Some(p) = line.strip_prefix("PID=") {
+                if child_pid == 0 {
+                    child_pid = p.parse().unwrap_or(0);
+                }
             } else if let Some(s) = line.strip_prefix("SOCK=") {
                 sock_path = Some(PathBuf::from(s));
             }
         }
-        let alive = pid > 0 && unsafe { libc::kill(pid as i32, 0) == 0 };
-        if !alive {
+        let valid = match sock_path.as_deref() {
+            Some(sp) => is_session_valid(host_pid, child_pid, sp),
+            None => false,
+        };
+        if !valid {
+            reap_orphaned_child(child_pid, host_pid);
             let _ = fs::remove_file(&path);
             if let Some(sp) = sock_path {
                 let _ = fs::remove_file(sp);
@@ -95,25 +217,33 @@ pub fn list_active_sessions() -> Result<Vec<SessionSummary>> {
             continue;
         };
         let mut id = String::new();
-        let mut pid = 0u32;
+        let mut host_pid = 0u32;
+        let mut child_pid = 0u32;
         let mut sock = PathBuf::new();
         let mut script = String::new();
         for line in content.lines() {
             if let Some(v) = line.strip_prefix("ID=") {
                 id = v.to_string();
+            } else if let Some(v) = line.strip_prefix("HOST_PID=") {
+                host_pid = v.parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("CHILD_PID=") {
+                child_pid = v.parse().unwrap_or(0);
             } else if let Some(v) = line.strip_prefix("PID=") {
-                pid = v.parse().unwrap_or(0);
+                if child_pid == 0 {
+                    child_pid = v.parse().unwrap_or(0);
+                }
             } else if let Some(v) = line.strip_prefix("SOCK=") {
                 sock = PathBuf::from(v);
             } else if let Some(v) = line.strip_prefix("SCRIPT=") {
                 script = v.to_string();
             }
         }
-        if !id.is_empty() && sock.exists() {
+        if !id.is_empty() && is_session_valid(host_pid, child_pid, &sock) {
             out.push(SessionSummary {
                 session_id: id,
                 socket_path: sock,
-                root_pid: pid,
+                host_pid: if host_pid > 0 { host_pid } else { child_pid },
+                root_pid: child_pid,
                 entry_script: script,
             });
         }
@@ -131,7 +261,10 @@ pub fn resolve_session_socket(id_or_prefix: &str) -> Result<PathBuf> {
         bail!("no active peek debugging sessions found");
     }
     for s in &active {
-        if s.session_id == id_or_prefix || s.root_pid.to_string() == id_or_prefix {
+        if s.session_id == id_or_prefix
+            || s.root_pid.to_string() == id_or_prefix
+            || s.host_pid.to_string() == id_or_prefix
+        {
             return Ok(s.socket_path.clone());
         }
     }
@@ -155,6 +288,7 @@ pub fn run_headless_server(
 ) -> Result<i32> {
     let _ = cleanup_stale_sessions();
     let root = user_session_root()?;
+    install_server_signal_handlers();
 
     let mut bps = Vec::new();
     for &line in initial_bp_lines {
@@ -164,6 +298,7 @@ pub fn run_headless_server(
     }
 
     let mut session = Session::spawn(&entry_script, &args, &bps, break_on_err)?;
+    let host_pid = std::process::id();
     let root_pid = session.pid();
     let session_id = session_name.unwrap_or_else(|| {
         let stem = entry_script
@@ -185,8 +320,10 @@ pub fn run_headless_server(
     listener.set_nonblocking(true)?;
 
     let meta_content = format!(
-        "ID={}\nPID={}\nSOCK={}\nSCRIPT={}\n",
+        "ID={}\nHOST_PID={}\nCHILD_PID={}\nPID={}\nSOCK={}\nSCRIPT={}\n",
         session_id,
+        host_pid,
+        root_pid,
         root_pid,
         sock_path.display(),
         entry_script.display()
@@ -194,10 +331,16 @@ pub fn run_headless_server(
     fs::write(&meta_path, meta_content)?;
     fs::set_permissions(&meta_path, Permissions::from_mode(0o600))?;
 
+    let _file_guard = SessionFileGuard {
+        sock_path: sock_path.clone(),
+        meta_path: meta_path.clone(),
+    };
+
     eprintln!(
-        "[peek] session '{}' listening on {} (target PID {})",
+        "[peek] session '{}' listening on {} (host PID {}, target Bash PID {})",
         session_id,
         sock_path.display(),
+        host_pid,
         root_pid
     );
     eprintln!(
@@ -210,7 +353,7 @@ pub fn run_headless_server(
         root_pid,
         ProcessMeta {
             pid: root_pid,
-            ppid: std::process::id(),
+            ppid: host_pid,
             role: "root".into(),
             script: entry_script.clone(),
             status: ProcessStatus::Running,
@@ -221,9 +364,23 @@ pub fn run_headless_server(
     let mut seq = 1u64;
     let mut client_stream: Option<UnixStream> = None;
     let mut client_rx: Option<Receiver<ClientMessage>> = None;
-    let mut final_exit = 0i32;
+    let mut final_exit = 130i32;
 
     loop {
+        if SERVER_SHUTDOWN.load(Ordering::SeqCst) {
+            if let Some(w) = client_stream.as_mut() {
+                let _ = write_message(
+                    w,
+                    &ServerMessage::Error {
+                        message: "Session host received termination signal".into(),
+                    }
+                    .encode(),
+                );
+            }
+            session.shutdown();
+            break;
+        }
+
         if let Ok((stream, _)) = listener.accept() {
             let _ = stream.set_nonblocking(false);
             if let Ok(reader_clone) = stream.try_clone() {
@@ -366,10 +523,27 @@ pub fn run_headless_server(
                         let _ = write_message(w, &ServerMessage::Stderr(line).encode());
                     }
                 }
-                EngineEvent::TtyHandoff(_cmd) => {
+                EngineEvent::TtyHandoff(cmd) => {
+                    if let Some(w) = client_stream.as_mut() {
+                        let _ = write_message(
+                            w,
+                            &ServerMessage::TtyHandoff {
+                                pid: root_pid,
+                                cmd,
+                            }
+                            .encode(),
+                        );
+                    }
                     let _ = session.send_tty_granted();
                 }
-                EngineEvent::TtyDone => {}
+                EngineEvent::TtyDone => {
+                    if let Some(w) = client_stream.as_mut() {
+                        let _ = write_message(
+                            w,
+                            &ServerMessage::TtyDone { pid: root_pid }.encode(),
+                        );
+                    }
+                }
             }
         }
 
@@ -378,7 +552,12 @@ pub fn run_headless_server(
         if let Some(rx) = client_rx.as_ref() {
             while let Ok(cmsg) = rx.try_recv() {
                 match cmsg {
-                    ClientMessage::Hello { .. } => {}
+                    ClientMessage::Hello {
+                        version,
+                        client_pid,
+                    } => {
+                        let _ = (version, client_pid);
+                    }
                     ClientMessage::Resume {
                         pid,
                         mode,
@@ -420,16 +599,32 @@ pub fn run_headless_server(
                         }
                         let _ = session.send_skip();
                     }
-                    ClientMessage::Eval { expr, .. } => {
+                    ClientMessage::Eval { pid, expr } => {
+                        let _ = pid;
                         let _ = session.send_eval(&expr);
                     }
                     ClientMessage::SendStdin { input } => {
                         let _ = session.send_stdin(&input);
                     }
-                    ClientMessage::TtyGranted { .. } => {
+                    ClientMessage::TtyGranted { pid } => {
+                        let _ = pid;
                         let _ = session.send_tty_granted();
                     }
-                    ClientMessage::TakeSnapshot { .. } | ClientMessage::SelectProcess { .. } => {}
+                    ClientMessage::TakeSnapshot { scope } => {
+                        if let Some(w) = client_stream.as_mut() {
+                            let sev = make_event(
+                                &mut seq,
+                                &session_id,
+                                root_pid,
+                                EventKind::SnapshotCaptured,
+                                format!("remote snapshot scope {}", scope.display()),
+                            );
+                            let _ = write_message(w, &ServerMessage::Event(sev).encode());
+                        }
+                    }
+                    ClientMessage::SelectProcess { pid } => {
+                        let _ = pid;
+                    }
                     ClientMessage::Disconnect => {
                         drop_client = true;
                     }
@@ -453,7 +648,8 @@ pub fn run_headless_server(
         if let Some(code) = session.try_wait_exit()? {
             final_exit = code;
             if let Some(w) = client_stream.as_mut() {
-                let _ = write_message(w, &ServerMessage::SessionExited { exit_code: code }.encode());
+                let _ =
+                    write_message(w, &ServerMessage::SessionExited { exit_code: code }.encode());
             }
             break;
         }
@@ -461,8 +657,6 @@ pub fn run_headless_server(
         thread::sleep(Duration::from_millis(10));
     }
 
-    let _ = fs::remove_file(&sock_path);
-    let _ = fs::remove_file(&meta_path);
     Ok(final_exit)
 }
 
@@ -575,5 +769,24 @@ impl RemoteClient {
 
     pub fn shutdown_remote(&mut self) {
         let _ = write_message(&mut self.writer, &ClientMessage::Shutdown.encode());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_orphaned_and_dead_session_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sock = tmp.path().join("test.sock");
+        fs::write(&sock, "").unwrap();
+
+        // Dead PID is never valid
+        assert!(!is_session_valid(999_999_991, 999_999_992, &sock));
+
+        // Current process with fake dead host_pid is invalid
+        let self_pid = std::process::id();
+        assert!(!is_session_valid(999_999_991, self_pid, &sock));
     }
 }

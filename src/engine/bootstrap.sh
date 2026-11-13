@@ -4,6 +4,7 @@ if [[ -z "${__PEEK_AGENT_INIT:-}" ]]; then
     __PEEK_AGENT_INIT=1
 
     exec {__PEEK_STATE_FD}> "$PEEK_STATE_FIFO"
+    exec {__PEEK_CMD_FD}< "$PEEK_CMD_FIFO"
     exec {__PEEK_LOCK_FD}> "$PEEK_LOCK_FILE"
     exec {__PEEK_SAVED_IN}<&0
     exec {__PEEK_SAVED_OUT}>&1
@@ -11,7 +12,7 @@ if [[ -z "${__PEEK_AGENT_INIT:-}" ]]; then
 
     __PEEK_ROOT_PID=$BASHPID
     __PEEK_LOCK_PID=$BASHPID
-    __PEEK_CMD_PID=0
+    __PEEK_CMD_PID=$BASHPID
     __PEEK_NONCE="$PEEK_NONCE"
     __PEEK_BOOT="$PEEK_BOOTSTRAP"
     __PEEK_TARGET_SCRIPT="$PEEK_TARGET"
@@ -47,7 +48,7 @@ __peek_ensure_cmd_fd() {
         if [[ -n "$__PEEK_SESSION_DIR" && -p "$__PEEK_SESSION_DIR/cmd.$BASHPID.fifo" ]]; then
             __pfifo="$__PEEK_SESSION_DIR/cmd.$BASHPID.fifo"
         fi
-        exec {__PEEK_CMD_FD}<> "$__pfifo"
+        exec {__PEEK_CMD_FD}< "$__pfifo"
         __PEEK_CMD_PID=$BASHPID
     fi
 }
@@ -365,8 +366,11 @@ __peek_hook() {
             __peek_ensure_cmd_fd
             __peek_lock
             printf "TTY_HANDOFF\t%s\n" "${__cmd//$'\n'/ }" >&"$__PEEK_STATE_FD"
-            local __ack
-            IFS= read -r -u "$__PEEK_CMD_FD" __ack
+            local __ack=""
+            if ! IFS= read -r -u "$__PEEK_CMD_FD" __ack; then
+                __peek_unlock
+                exit 130
+            fi
             __peek_unlock
             if [[ "$__ack" == "TTY_GRANTED" ]]; then
                 exec 0</dev/tty 1>/dev/tty 2>/dev/tty 2>/dev/null
@@ -384,7 +388,8 @@ __peek_hook() {
     __peek_emit_frame "STOP" "$__src" "$__line" "$__rc" "$__pipe_str" "$__cmd"
 
     local __force_tty=0
-    local __msg
+    local __msg=""
+    local __got_cmd=0
     while IFS= read -r -u "$__PEEK_CMD_FD" __msg; do
         case "$__msg" in
             RESUME:*)
@@ -395,6 +400,7 @@ __peek_hook() {
                     export PEEK_INIT_ERR_TRAP="$__PEEK_ERR_TRAP"
                     export PEEK_INIT_COND="$__PEEK_COND"
                 fi
+                __got_cmd=1
                 break
                 ;;
             RESUME_TTY:*)
@@ -406,6 +412,7 @@ __peek_hook() {
                     export PEEK_INIT_COND="$__PEEK_COND"
                 fi
                 __force_tty=1
+                __got_cmd=1
                 break
                 ;;
             SKIP)
@@ -432,10 +439,18 @@ __peek_hook() {
         esac
     done
 
+    if (( __got_cmd == 0 )); then
+        __peek_unlock
+        exit 130
+    fi
+
     if (( (__force_tty == 1 || __in_subshell == 0) )) && { (( __force_tty == 1 )) || __peek_needs_tty "$__cmd"; }; then
         printf "TTY_HANDOFF\t%s\n" "${__cmd//$'\n'/ }" >&"$__PEEK_STATE_FD"
-        local __ack
-        IFS= read -r -u "$__PEEK_CMD_FD" __ack
+        local __ack=""
+        if ! IFS= read -r -u "$__PEEK_CMD_FD" __ack; then
+            __peek_unlock
+            exit 130
+        fi
         if [[ "$__ack" == "TTY_GRANTED" ]]; then
             exec 0</dev/tty 1>/dev/tty 2>/dev/tty 2>/dev/null
             __PEEK_TTY_ACTIVE=1
