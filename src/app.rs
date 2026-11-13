@@ -8,6 +8,7 @@ use std::time::Instant;
 use anyhow::Result;
 use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 
+use crate::analyzer::ScriptDiagnostic;
 use crate::engine::{parser::RawFrame, EngineEvent, ResumeMode, Session};
 use crate::protocol::{ClientMessage, EventKind, ProcessStatus, ServerMessage};
 use crate::security::{redact_command_args, redact_value};
@@ -45,6 +46,7 @@ pub enum BottomTab {
     Console,
     Events,
     Snapshots,
+    Diagnostics,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +97,13 @@ impl SessionBackend {
         match self {
             SessionBackend::Local(s) => s.shutdown(),
             SessionBackend::Remote(r) => r.disconnect(),
+        }
+    }
+
+    pub fn terminate_all(&mut self) {
+        match self {
+            SessionBackend::Local(s) => s.shutdown(),
+            SessionBackend::Remote(r) => r.shutdown_remote(),
         }
     }
 }
@@ -299,6 +308,10 @@ impl App {
         self.proc_table.active_history()
     }
 
+    pub fn active_diagnostics(&self) -> &[ScriptDiagnostic] {
+        self.sources.get_diagnostics(&self.viewed_file)
+    }
+
     pub fn send_tty_granted(&mut self) -> Result<()> {
         let pid = self.pid();
         match &mut self.backend {
@@ -440,10 +453,13 @@ impl App {
                         self.output_scroll = self.logs.len().saturating_sub(1);
                     }
                 }
-                ServerMessage::TtyHandoff { cmd, .. } => {
-                    self.status = format!("Remote process requested TTY for: {}", cmd);
+                ServerMessage::TtyHandoff { pid, cmd } => {
+                    self.status =
+                        format!("Remote process PID {} requested TTY for: {}", pid, cmd);
                 }
-                ServerMessage::TtyDone { .. } => {}
+                ServerMessage::TtyDone { pid } => {
+                    self.status = format!("Remote process PID {} finished TTY session", pid);
+                }
                 ServerMessage::SessionExited { exit_code } => {
                     self.exec_state = ExecState::Exited(exit_code);
                     self.status = format!(
@@ -453,6 +469,11 @@ impl App {
                 }
                 ServerMessage::Error { message } => {
                     self.exec_state = ExecState::Disconnected;
+                    self.events.record(
+                        self.pid(),
+                        EventKind::CommFailure,
+                        message.clone(),
+                    );
                     self.events.record(
                         self.pid(),
                         EventKind::DebuggerDisconnected,
@@ -619,6 +640,11 @@ impl App {
             });
 
         self.snapshot_scope = Some(scope.clone());
+        if let SessionBackend::Remote(ref mut r) = self.backend {
+            let _ = r.send(&ClientMessage::TakeSnapshot {
+                scope: scope.clone(),
+            });
+        }
         let id = self.fs_snapshots.len() + 1;
         let pid = self.pid();
         let step = self.step_counter;
@@ -775,7 +801,8 @@ impl App {
             self.break_on_err,
         )?;
         let root_pid = session.pid();
-        self.proc_table = ProcessTable::new(root_pid, self.entry_script.clone(), MAX_HISTORY_FRAMES);
+        self.proc_table =
+            ProcessTable::new(root_pid, self.entry_script.clone(), MAX_HISTORY_FRAMES);
         self.backend = SessionBackend::Local(session);
         self.exec_state = ExecState::Running;
         self.status = "Session restarted cleanly".into();
@@ -789,8 +816,13 @@ impl App {
         };
 
         let mut report = String::new();
-        let _ = writeln!(report, "# peek Diagnostic Snapshot");
-        let _ = writeln!(report, "- **Session:** `{}` (PID `{}`)", self.session_id, self.pid());
+        let _ = writeln!(report, "# peek v2.0.0 Diagnostic Snapshot");
+        let _ = writeln!(
+            report,
+            "- **Session:** `{}` (PID `{}`)",
+            self.session_id,
+            self.pid()
+        );
         let _ = writeln!(report, "- **Script:** `{}`", snap.file.display());
         let _ = writeln!(
             report,
@@ -840,6 +872,21 @@ impl App {
             );
         }
 
+        let diags = self.active_diagnostics();
+        if !diags.is_empty() {
+            let _ = writeln!(report, "\n## Static Analysis Diagnostics");
+            for d in diags {
+                let _ = writeln!(
+                    report,
+                    "- **[{} {}]** line {}: {}",
+                    d.code,
+                    d.severity.tag(),
+                    d.line,
+                    d.message
+                );
+            }
+        }
+
         if let Some(ref diff) = self.latest_diff {
             let _ = writeln!(
                 report,
@@ -847,7 +894,12 @@ impl App {
                 diff.from_id, diff.to_id
             );
             for ch in &diff.changes {
-                let _ = writeln!(report, "- `{}` `{}`", ch.kind.symbol(), ch.rel_path.display());
+                let _ = writeln!(
+                    report,
+                    "- `{}` `{}`",
+                    ch.kind.symbol(),
+                    ch.rel_path.display()
+                );
             }
         }
 
@@ -974,9 +1026,16 @@ impl App {
                 self.backend.shutdown();
                 return Ok(true);
             }
+            KeyCode::Char('Q') => {
+                self.backend.terminate_all();
+                return Ok(true);
+            }
             KeyCode::Char('?') => self.modal = OverlayModal::Help,
             KeyCode::Char('P') => {
                 let next_pid = self.proc_table.cycle_next_process();
+                if let SessionBackend::Remote(ref mut r) = self.backend {
+                    let _ = r.send(&ClientMessage::SelectProcess { pid: next_pid });
+                }
                 if let Some(snap) = self.active_history().and_then(|h| h.active()).cloned() {
                     self.viewed_file = snap.file;
                     self.cursor_line = snap.line;
@@ -1014,7 +1073,8 @@ impl App {
                 self.bottom_tab = match self.bottom_tab {
                     BottomTab::Console => BottomTab::Events,
                     BottomTab::Events => BottomTab::Snapshots,
-                    BottomTab::Snapshots => BottomTab::Console,
+                    BottomTab::Snapshots => BottomTab::Diagnostics,
+                    BottomTab::Diagnostics => BottomTab::Console,
                 };
                 self.output_scroll = 0;
             }
@@ -1269,6 +1329,7 @@ impl App {
                         .as_ref()
                         .map(|d| d.changes.len())
                         .unwrap_or(self.fs_snapshots.len()),
+                    BottomTab::Diagnostics => self.active_diagnostics().len(),
                 };
                 let max = len.saturating_sub(1);
                 self.output_scroll = (self.output_scroll + step).min(max);

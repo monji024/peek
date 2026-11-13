@@ -6,8 +6,12 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::protocol::{DebugEvent, EventKind, ProcessMeta, ProcessStatus};
 use self::history::HistoryBuffer;
+use crate::analyzer::{analyze_bash_source, ScriptDiagnostic};
+use crate::protocol::{DebugEvent, EventKind, ProcessMeta, ProcessStatus};
+
+const MAX_CACHED_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CACHED_FILES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VarKind {
@@ -303,6 +307,7 @@ impl ProcessTable {
 
 pub struct SourceCache {
     files: HashMap<PathBuf, Vec<String>>,
+    diagnostics: HashMap<PathBuf, Vec<ScriptDiagnostic>>,
     profiles: HashMap<(PathBuf, usize), LineProfile>,
 }
 
@@ -310,23 +315,50 @@ impl SourceCache {
     pub fn new() -> Self {
         Self {
             files: HashMap::new(),
+            diagnostics: HashMap::new(),
             profiles: HashMap::new(),
         }
     }
 
     pub fn ensure_loaded(&mut self, path: &Path) -> &[String] {
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.files.entry(canonical).or_insert_with(|| match std::fs::read(path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes)
-                .lines()
-                .map(String::from)
-                .collect(),
-            Err(e) => vec![format!("# [peek: unable to read {:?}: {}]", path, e)],
-        })
+        if !self.files.contains_key(&canonical) {
+            if self.files.len() >= MAX_CACHED_FILES {
+                self.files.clear();
+                self.diagnostics.clear();
+            }
+            let loaded_lines: Vec<String> = match std::fs::metadata(path) {
+                Ok(meta) if meta.len() > MAX_CACHED_SOURCE_BYTES => {
+                    vec![format!(
+                        "# [peek: source file {:?} exceeds 8 MiB limit ({} bytes)]",
+                        path,
+                        meta.len()
+                    )]
+                }
+                _ => match std::fs::read(path) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes)
+                        .lines()
+                        .map(String::from)
+                        .collect(),
+                    Err(e) => vec![format!("# [peek: unable to read {:?}: {}]", path, e)],
+                },
+            };
+            let diags = analyze_bash_source(&loaded_lines);
+            self.diagnostics.insert(canonical.clone(), diags);
+            self.files.insert(canonical.clone(), loaded_lines);
+        }
+        self.files.get(&canonical).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     pub fn get_lines(&self, path: &Path) -> &[String] {
         self.files.get(path).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    pub fn get_diagnostics(&self, path: &Path) -> &[ScriptDiagnostic] {
+        self.diagnostics
+            .get(path)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     pub fn record_profile(&mut self, file: PathBuf, line: usize, elapsed: Duration) {
