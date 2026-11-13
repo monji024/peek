@@ -4,3 +4,4 @@ peek-report.md
 *.swp
 *.bak
 .DS_Store
+__pycache__/
