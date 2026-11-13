@@ -30,7 +30,7 @@ pub enum ResumeMode {
 }
 
 impl ResumeMode {
-    fn as_protocol_str(self) -> &'static str {
+    pub fn as_protocol_str(self) -> &'static str {
         match self {
             ResumeMode::Step => "STEP",
             ResumeMode::Next => "NEXT",
@@ -38,10 +38,31 @@ impl ResumeMode {
             ResumeMode::Continue => "CONT",
         }
     }
+
+    pub fn from_protocol_str(s: &str) -> Option<Self> {
+        match s {
+            "STEP" => Some(ResumeMode::Step),
+            "NEXT" => Some(ResumeMode::Next),
+            "OUT" => Some(ResumeMode::Out),
+            "CONT" => Some(ResumeMode::Continue),
+            _ => None,
+        }
+    }
 }
 
+#[derive(Debug, Clone)]
 pub enum EngineEvent {
     Frame(RawFrame),
+    ProcessStarted {
+        pid: u32,
+        ppid: u32,
+        role: String,
+        script: PathBuf,
+    },
+    ProcessExited {
+        pid: u32,
+        exit_code: i32,
+    },
     TtyHandoff(String),
     TtyDone,
     Stdout(String),
@@ -50,6 +71,7 @@ pub enum EngineEvent {
 
 pub struct Session {
     _temp_dir: TempDir,
+    session_dir: PathBuf,
     child: Child,
     child_stdin: Option<ChildStdin>,
     cmd_fifo: File,
@@ -64,10 +86,11 @@ impl Session {
         break_on_err: bool,
     ) -> Result<Self> {
         let temp_dir = tempfile::tempdir().context("failed to allocate session tempdir")?;
-        let state_path = temp_dir.path().join("state.fifo");
-        let cmd_path = temp_dir.path().join("cmd.fifo");
-        let lock_path = temp_dir.path().join("subshell.lock");
-        let bootstrap_path = temp_dir.path().join("bootstrap.sh");
+        let session_dir = temp_dir.path().to_path_buf();
+        let state_path = session_dir.join("state.fifo");
+        let cmd_path = session_dir.join("cmd.fifo");
+        let lock_path = session_dir.join("subshell.lock");
+        let bootstrap_path = session_dir.join("bootstrap.sh");
 
         create_fifo(&state_path)?;
         create_fifo(&cmd_path)?;
@@ -99,6 +122,7 @@ impl Session {
             .env("PEEK_LOCK_FILE", &lock_path)
             .env("PEEK_BOOTSTRAP", &bootstrap_path)
             .env("PEEK_TARGET", target_script)
+            .env("PEEK_SESSION_DIR", &session_dir)
             .env("PEEK_INIT_BPS", bp_spec)
             .env("PEEK_INIT_ERR_TRAP", if break_on_err { "1" } else { "0" })
             .env("PEEK_NONCE", &nonce)
@@ -125,7 +149,9 @@ impl Session {
         thread::spawn(move || {
             let mut reader = BufReader::new(state_fifo);
             let mut raw_buf = Vec::with_capacity(512);
-            let tty_done_marker = format!("TTY_DONE\t{}", nonce);
+            let tty_done_prefix = format!("TTY_DONE\t{}", nonce);
+            let proc_start_prefix = format!("PROC_START\t{}\t", nonce);
+            let proc_exit_prefix = format!("PROC_EXIT\t{}\t", nonce);
 
             while let Ok(Some(header)) = read_lossy_line(&mut reader, &mut raw_buf) {
                 if header.starts_with("STOP\t") || header.starts_with("SYNC\t") {
@@ -134,11 +160,35 @@ impl Session {
                             break;
                         }
                     }
+                } else if let Some(rest) = header.strip_prefix(&proc_start_prefix) {
+                    let mut sp = rest.splitn(4, '\t');
+                    let pid = sp.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let ppid = sp.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let role = sp.next().unwrap_or("child").to_string();
+                    let script = PathBuf::from(sp.next().unwrap_or(""));
+                    if pid > 0 {
+                        let _ = tx.send(EngineEvent::ProcessStarted {
+                            pid,
+                            ppid,
+                            role,
+                            script,
+                        });
+                    }
+                } else if let Some(rest) = header.strip_prefix(&proc_exit_prefix) {
+                    let mut sp = rest.splitn(2, '\t');
+                    let pid = sp.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let exit_code = sp.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    if pid > 0 {
+                        let _ = tx.send(EngineEvent::ProcessExited { pid, exit_code });
+                    }
                 } else if let Some(cmd_str) = header.strip_prefix("TTY_HANDOFF\t") {
-                    if tx.send(EngineEvent::TtyHandoff(cmd_str.to_string())).is_err() {
+                    if tx
+                        .send(EngineEvent::TtyHandoff(cmd_str.to_string()))
+                        .is_err()
+                    {
                         break;
                     }
-                } else if header == tty_done_marker {
+                } else if header.starts_with(&tty_done_prefix) {
                     if tx.send(EngineEvent::TtyDone).is_err() {
                         break;
                     }
@@ -148,6 +198,7 @@ impl Session {
 
         Ok(Self {
             _temp_dir: temp_dir,
+            session_dir,
             child,
             child_stdin,
             cmd_fifo,
@@ -157,6 +208,10 @@ impl Session {
 
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    pub fn session_dir(&self) -> &Path {
+        &self.session_dir
     }
 
     pub fn try_recv(&self) -> Option<EngineEvent> {
@@ -249,7 +304,7 @@ impl Drop for Session {
     }
 }
 
-fn create_fifo(path: &Path) -> Result<()> {
+pub fn create_fifo(path: &Path) -> Result<()> {
     let c_path = CString::new(path.as_os_str().as_bytes())?;
     let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
     if rc != 0 {
@@ -267,7 +322,7 @@ fn tune_pipe_capacity(fd: i32) {
     let _ = fd;
 }
 
-fn generate_session_nonce() -> String {
+pub fn generate_session_nonce() -> String {
     let mut bytes = [0u8; 8];
     if let Ok(mut f) = File::open("/dev/urandom") {
         if f.read_exact(&mut bytes).is_ok() {
@@ -281,7 +336,7 @@ fn generate_session_nonce() -> String {
     format!("{:016x}", nanos ^ (std::process::id() as u64))
 }
 
-fn format_bp_list(bps: &[(PathBuf, usize)]) -> String {
+pub fn format_bp_list(bps: &[(PathBuf, usize)]) -> String {
     bps.iter()
         .map(|(file, line)| format!("{}:{}", file.display(), line))
         .collect::<Vec<_>>()
@@ -296,8 +351,7 @@ fn pump_output<R: Read>(stream: R, tx: mpsc::Sender<EngineEvent>, is_stderr: boo
             EngineEvent::Stderr(line)
         } else {
             EngineEvent::Stdout(line)
-        }
-        ;
+        };
         if tx.send(ev).is_err() {
             break;
         }
