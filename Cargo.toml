@@ -2,10 +2,10 @@
 
 [package]
 name = "bash-peek"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 authors = ["monji024 <https://github.com/monji024>"]
-description = "Interactive TUI debugger, line profiler, and time-travel inspector for Bash scripts"
+description = "Interactive TUI debugger, line profiler, static analyzer, and time-travel inspector for Bash scripts"
 repository = "https://github.com/monji024/peek"
 license = "MIT"
 readme = "README.md"

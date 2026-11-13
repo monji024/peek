@@ -8,11 +8,12 @@ use ratatui::{
     Frame,
 };
 
+use super::theme::{Palette, ThemeMode};
+use crate::analyzer::DiagnosticSeverity;
 use crate::app::{App, BottomTab, ExecState, PaneFocus, PromptMode};
 use crate::protocol::ProcessStatus;
 use crate::snapshot::DiffKind;
 use crate::state::{LogStream, VarKind};
-use super::theme::Palette;
 
 const BASH_KEYWORDS: &[&str] = &[
     "if", "then", "else", "elif", "fi", "for", "in", "do", "done", "while", "until", "case",
@@ -23,7 +24,7 @@ const BASH_KEYWORDS: &[&str] = &[
 pub fn render_minimal_viewport(f: &mut Frame, app: &App, area: Rect) {
     let pal = app.palette();
     let msg = format!(
-        "peek [{}] L:{} PID:{} — {}",
+        "peek v2.0.0 [{}] L:{} PID:{} — {}",
         app.session_id,
         app.cursor_line,
         app.pid(),
@@ -61,33 +62,43 @@ pub fn render_top_ribbon(f: &mut Frame, app: &App, area: Rect) {
         .map(|(c, t)| format!("{}/{}", c, t))
         .unwrap_or_else(|| "0/0".into());
 
+    let start_label = if pal.mode == ThemeMode::LunaBlue {
+        " start | peek v2.0 "
+    } else {
+        " peek v2.0 "
+    };
+
     let mut left_spans = vec![
         Span::styled(
-            " peek ",
+            start_label,
             Style::default()
                 .fg(pal.badge_fg)
                 .bg(pal.badge_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(" {} ", app.theme_mode.label()),
-            Style::default().fg(pal.syn_comment),
+            format!(" [{}] ", pal.mode.label()),
+            Style::default()
+                .fg(Color::White)
+                .bg(pal.bg_status_top)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
-        Span::styled("target ", Style::default().fg(pal.syn_comment)),
+        Span::styled(" target:", Style::default().fg(pal.syn_comment)),
         Span::styled(
-            app.viewed_file
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("script.sh"),
+            format!(
+                " {} ",
+                app.viewed_file
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("script.sh")
+            ),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
-        Span::styled("status ", Style::default().fg(pal.syn_comment)),
+        Span::styled(" $?=", Style::default().fg(pal.syn_comment)),
         Span::styled(
-            format!("$?={}{}", rc, pipe_str),
+            format!("{}{}", rc, pipe_str),
             Style::default()
                 .fg(if rc == 0 {
                     pal.syn_string
@@ -96,22 +107,18 @@ pub fn render_top_ribbon(f: &mut Frame, app: &App, area: Rect) {
                 })
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
-        Span::styled("step ", Style::default().fg(pal.syn_comment)),
+        Span::styled("  step:", Style::default().fg(pal.syn_comment)),
         Span::styled(frame_str, Style::default().fg(Color::White)),
-        Span::raw("  "),
-        Span::styled("dt ", Style::default().fg(pal.syn_comment)),
+        Span::styled("  dt:", Style::default().fg(pal.syn_comment)),
         Span::styled(latency_str, Style::default().fg(pal.syn_text)),
-        Span::raw("  "),
-        Span::styled("procs ", Style::default().fg(pal.syn_comment)),
+        Span::styled("  procs:", Style::default().fg(pal.syn_comment)),
         Span::styled(
             format!("{} (sub:{})", app.proc_table.len(), subshell),
-            Style::default().fg(Color::LightMagenta),
+            Style::default().fg(Color::LightYellow),
         ),
-        Span::raw("  "),
-        Span::styled("err-trap ", Style::default().fg(pal.syn_comment)),
+        Span::styled("  err-trap:", Style::default().fg(pal.syn_comment)),
         Span::styled(
-            if app.break_on_err { "on" } else { "off" },
+            if app.break_on_err { "ON " } else { "off " },
             Style::default()
                 .fg(if app.break_on_err {
                     Color::LightRed
@@ -123,12 +130,29 @@ pub fn render_top_ribbon(f: &mut Frame, app: &App, area: Rect) {
     ];
 
     if !app.cond_breakpoint.is_empty() {
-        left_spans.push(Span::raw("  "));
-        left_spans.push(Span::styled("when ", Style::default().fg(pal.syn_comment)));
+        left_spans.push(Span::styled(" when:", Style::default().fg(pal.syn_comment)));
         left_spans.push(Span::styled(
-            app.cond_breakpoint.as_str(),
+            format!(" {} ", app.cond_breakpoint),
             Style::default()
                 .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if pal.mode == ThemeMode::LunaBlue {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            " [_][#] ",
+            Style::default()
+                .fg(Color::White)
+                .bg(pal.bg_status_bottom)
+                .add_modifier(Modifier::BOLD),
+        ));
+        left_spans.push(Span::styled(
+            " [X] ",
+            Style::default()
+                .fg(Color::White)
+                .bg(pal.accent_close_bg)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -142,6 +166,7 @@ pub fn render_top_ribbon(f: &mut Frame, app: &App, area: Rect) {
 pub fn render_source(f: &mut Frame, app: &App, area: Rect) {
     let pal = app.palette();
     let lines = app.active_source_lines();
+    let diags = app.active_diagnostics();
     let focused = app.focus == PaneFocus::Source;
     let file_label = app
         .viewed_file
@@ -165,9 +190,10 @@ pub fn render_source(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(format!(" {} ", file_label), pal.title(focused)),
         Span::styled(
             format!(
-                "({} lines, {} bp{}) ",
+                "({} lines, {} bp, {} hints{}) ",
                 lines.len(),
                 app.breakpoints.len(),
+                diags.len(),
                 search_badge
             ),
             Style::default().fg(pal.syn_comment),
@@ -177,8 +203,9 @@ pub fn render_source(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_type(app.theme_mode.border_type())
-        .border_style(pal.border(focused));
+        .border_type(pal.mode.border_type())
+        .border_style(pal.border(focused))
+        .style(Style::default().bg(pal.bg_canvas));
 
     let visible = area.height.saturating_sub(2) as usize;
     let is_traveling = hist.map(|h| h.is_time_traveling()).unwrap_or(false);
@@ -191,6 +218,7 @@ pub fn render_source(f: &mut Frame, app: &App, area: Rect) {
         .map(|(idx, text)| {
             let lno = idx + 1;
             let has_bp = app.has_breakpoint(&app.viewed_file, lno);
+            let has_diag = diags.iter().any(|d| d.line == lno);
             let is_exec = active_line == Some(lno);
             let is_cursor = app.cursor_line == lno;
 
@@ -203,7 +231,7 @@ pub fn render_source(f: &mut Frame, app: &App, area: Rect) {
             } else if is_cursor {
                 Style::default().bg(pal.bg_cursor_line)
             } else {
-                Style::default()
+                Style::default().bg(pal.bg_canvas)
             };
 
             let heat_span = match app.sources.get_profile(&app.viewed_file, lno) {
@@ -221,11 +249,16 @@ pub fn render_source(f: &mut Frame, app: &App, area: Rect) {
                 _ => Span::styled("      ", bg),
             };
 
+            let marker_span = if has_bp {
+                Span::styled(" *", bg.fg(Color::LightRed).add_modifier(Modifier::BOLD))
+            } else if has_diag {
+                Span::styled(" !", bg.fg(Color::LightYellow).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled("  ", bg)
+            };
+
             let mut spans = vec![
-                Span::styled(
-                    if has_bp { " *" } else { "  " },
-                    bg.fg(Color::LightRed).add_modifier(Modifier::BOLD),
-                ),
+                marker_span,
                 Span::styled(
                     if is_exec { "> " } else { "  " },
                     bg.fg(if is_traveling {
@@ -394,8 +427,9 @@ pub fn render_variables(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_type(app.theme_mode.border_type())
-        .border_style(pal.border(focused));
+        .border_type(pal.mode.border_type())
+        .border_style(pal.border(focused))
+        .style(Style::default().bg(pal.bg_canvas));
 
     let visible = area.height.saturating_sub(2) as usize;
     let mut items = Vec::new();
@@ -436,7 +470,7 @@ pub fn render_variables(f: &mut Frame, app: &App, area: Rect) {
         let row_bg = if is_selected {
             Style::default().bg(pal.bg_cursor_line)
         } else {
-            Style::default()
+            Style::default().bg(pal.bg_canvas)
         };
 
         let tag_color = match v.kind {
@@ -512,8 +546,9 @@ pub fn render_stack(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_type(app.theme_mode.border_type())
-        .border_style(pal.border(focused));
+        .border_type(pal.mode.border_type())
+        .border_style(pal.border(focused))
+        .style(Style::default().bg(pal.bg_canvas));
 
     let mut items = Vec::new();
     if stack.is_empty() {
@@ -560,11 +595,15 @@ pub fn render_output(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == PaneFocus::Output;
 
     let tab_label = match app.bottom_tab {
-        BottomTab::Console => format!(" Console Output ({}) [v:events/snaps] ", app.logs.len()),
-        BottomTab::Events => format!(" Event Timeline ({}) [v:snaps/console] ", app.events.len()),
+        BottomTab::Console => format!(" Console Output ({}) [v:events/snaps/lint] ", app.logs.len()),
+        BottomTab::Events => format!(" Event Timeline ({}) [v:snaps/lint/console] ", app.events.len()),
         BottomTab::Snapshots => format!(
-            " File Snapshots ({} snaps) [d:capture D:scope v:console] ",
+            " File Snapshots ({} snaps) [d:capture D:scope v:lint] ",
             app.fs_snapshots.len()
+        ),
+        BottomTab::Diagnostics => format!(
+            " Script Diagnostics ({} findings) [v:console] ",
+            app.active_diagnostics().len()
         ),
     };
 
@@ -573,8 +612,9 @@ pub fn render_output(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_type(app.theme_mode.border_type())
-        .border_style(pal.border(focused));
+        .border_type(pal.mode.border_type())
+        .border_style(pal.border(focused))
+        .style(Style::default().bg(pal.bg_canvas));
 
     let visible = area.height.saturating_sub(2) as usize;
 
@@ -633,8 +673,8 @@ pub fn render_output(f: &mut Frame, app: &App, area: Rect) {
                 if diff.changes.is_empty() {
                     vec![ListItem::new(Line::from(Span::styled(
                         format!(
-                            "  Snapshot #{} vs #{}: no file changes detected in scope",
-                            diff.from_id, diff.to_id
+                            "  Snapshot #{} vs #{} (PID {}, step #{}): no file changes detected in scope",
+                            diff.from_id, diff.to_id, diff.pid, diff.step_index
                         ),
                         Style::default().fg(pal.syn_comment),
                     )))]
@@ -650,9 +690,9 @@ pub fn render_output(f: &mut Frame, app: &App, area: Rect) {
                                 DiffKind::Deleted => Color::LightRed,
                             };
                             let sz = match (ch.old_size, ch.new_size) {
-                                (None, Some(n)) => format!(" ({} B)", n),
-                                (Some(o), Some(n)) => format!(" ({} B -> {} B)", o, n),
-                                (Some(o), None) => format!(" (was {} B)", o),
+                                (None, Some(n)) => format!(" ({} B, {:03o})", n, ch.mode),
+                                (Some(o), Some(n)) => format!(" ({} B -> {} B, {:03o})", o, n, ch.mode),
+                                (Some(o), None) => format!(" (was {} B, {:03o})", o, ch.mode),
                                 _ => String::new(),
                             };
                             ListItem::new(Line::from(vec![
@@ -670,11 +710,17 @@ pub fn render_output(f: &mut Frame, app: &App, area: Rect) {
                         .collect()
                 }
             } else if let Some(last) = app.fs_snapshots.last() {
+                let trunc_note = if last.truncated { " [truncated]" } else { "" };
                 vec![ListItem::new(Line::from(Span::styled(
                     format!(
-                        "  Baseline snapshot #{} captured ({} files in {}). Press 'd' again after stepping to compare.",
+                        "  Baseline snapshot #{} captured at step #{} (PID {}, {} files, {} skipped, ts {}{} in {}). Press 'd' again after stepping to compare.",
                         last.id,
+                        last.step_index,
+                        last.pid,
                         last.entries.len(),
+                        last.skipped_errors,
+                        last.timestamp_ms,
+                        trunc_note,
                         last.root_scope.display()
                     ),
                     Style::default().fg(pal.syn_text),
@@ -684,6 +730,39 @@ pub fn render_output(f: &mut Frame, app: &App, area: Rect) {
                     "  No file snapshots captured yet. Press 'd' to snapshot working dir or 'D' to set scope.",
                     Style::default().fg(pal.syn_comment),
                 )))]
+            }
+        }
+        BottomTab::Diagnostics => {
+            let diags = app.active_diagnostics();
+            if diags.is_empty() {
+                vec![ListItem::new(Line::from(Span::styled(
+                    "  No static Bash pitfalls detected in active source file.",
+                    Style::default().fg(pal.syn_string),
+                )))]
+            } else {
+                diags
+                    .iter()
+                    .skip(app.output_scroll)
+                    .take(visible)
+                    .map(|d| {
+                        let sev_color = match d.severity {
+                            DiagnosticSeverity::High => Color::LightRed,
+                            DiagnosticSeverity::Warning => Color::LightYellow,
+                            DiagnosticSeverity::Advisory => Color::LightCyan,
+                        };
+                        ListItem::new(Line::from(vec![
+                            Span::styled(
+                                format!("  [{} {}] ", d.code, d.severity.tag()),
+                                Style::default().fg(sev_color).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!("line {:<4} ", d.line),
+                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(d.message.as_str(), Style::default().fg(pal.syn_text)),
+                        ]))
+                    })
+                    .collect()
             }
         }
     };
@@ -709,10 +788,10 @@ pub fn render_statusline(f: &mut Frame, app: &App, area: Rect) {
         (" HISTORY ", Color::Yellow)
     } else {
         match app.exec_state {
-            ExecState::Paused => (" PAUSED ", Color::LightGreen),
+            ExecState::Paused => (" PAUSED ", pal.badge_bg),
             ExecState::Running => (" RUNNING ", Color::Cyan),
             ExecState::Exited(_) => (" EXITED ", Color::Blue),
-            ExecState::Disconnected => (" DETACHED ", Color::LightRed),
+            ExecState::Disconnected => (" DETACHED ", pal.accent_close_bg),
         }
     };
 
@@ -720,7 +799,7 @@ pub fn render_statusline(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             mode_str,
             Style::default()
-                .fg(Color::Black)
+                .fg(Color::White)
                 .bg(mode_bg)
                 .add_modifier(Modifier::BOLD),
         ),
@@ -776,35 +855,42 @@ pub fn render_statusline(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let k = Style::default()
-        .fg(pal.syn_var)
+        .fg(Color::LightYellow)
         .add_modifier(Modifier::BOLD);
-    let d = Style::default().fg(pal.syn_comment);
+    let d = Style::default().fg(Color::White);
 
     let hints = Line::from(vec![
+        Span::styled(
+            " [Start] ",
+            Style::default()
+                .fg(pal.badge_fg)
+                .bg(pal.badge_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" s", k),
-        Span::styled(" step ", d),
+        Span::styled(":step ", d),
         Span::styled("n", k),
-        Span::styled(" next ", d),
+        Span::styled(":next ", d),
         Span::styled("o", k),
-        Span::styled(" out ", d),
+        Span::styled(":out ", d),
         Span::styled("c", k),
-        Span::styled(" cont ", d),
+        Span::styled(":cont ", d),
         Span::styled("S", k),
-        Span::styled(" skip ", d),
+        Span::styled(":skip ", d),
         Span::styled("[/]", k),
-        Span::styled(" hist ", d),
+        Span::styled(":hist ", d),
         Span::styled("b/C", k),
-        Span::styled(" brk ", d),
+        Span::styled(":brk ", d),
         Span::styled("d/v", k),
-        Span::styled(" snap/view ", d),
+        Span::styled(":snap/tab ", d),
         Span::styled("P", k),
-        Span::styled(" procs ", d),
+        Span::styled(":procs ", d),
         Span::styled("t", k),
-        Span::styled(" theme ", d),
+        Span::styled(":theme ", d),
         Span::styled("?", k),
-        Span::styled(" help ", d),
+        Span::styled(":help ", d),
         Span::styled("q", k),
-        Span::styled(" quit", d),
+        Span::styled(":quit", d),
     ]);
     f.render_widget(
         Paragraph::new(hints).style(Style::default().bg(pal.bg_status_bottom)),
@@ -826,16 +912,17 @@ pub fn render_inspector_modal(f: &mut Frame, app: &App) {
             Span::styled(
                 format!(" Inspect: {} [{}] ", var.name, var.kind.tag()),
                 Style::default()
-                    .fg(Color::LightCyan)
+                    .fg(Color::White)
+                    .bg(pal.bg_status_top)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "(Esc / Enter to close, 'M' toggles secret masking) ",
+                " (Esc / Enter to close, 'M' toggles secret masking) ",
                 Style::default().fg(pal.syn_comment),
             ),
         ]))
         .borders(Borders::ALL)
-        .border_type(app.theme_mode.border_type())
+        .border_type(pal.mode.border_type())
         .border_style(Style::default().fg(pal.border_active))
         .style(Style::default().bg(pal.bg_modal));
 
@@ -907,15 +994,16 @@ pub fn render_processes_modal(f: &mut Frame, app: &App) {
                 format!(" Session '{}' — Tracked Bash Processes ", app.session_id),
                 Style::default()
                     .fg(Color::White)
+                    .bg(pal.bg_status_top)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "('P' cycle active process, Esc close) ",
+                " ('P' cycle active process, Esc close) ",
                 Style::default().fg(pal.syn_comment),
             ),
         ]))
         .borders(Borders::ALL)
-        .border_type(app.theme_mode.border_type())
+        .border_type(pal.mode.border_type())
         .border_style(Style::default().fg(pal.border_active))
         .style(Style::default().bg(pal.bg_modal));
 
@@ -966,18 +1054,19 @@ pub fn render_processes_modal(f: &mut Frame, app: &App) {
 
 pub fn render_help_modal(f: &mut Frame, app: &App) {
     let pal = app.palette();
-    let area = centered_rect(72, 80, f.area());
+    let area = centered_rect(74, 82, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
         .title(Line::from(vec![Span::styled(
-            " peek — Keyboard Reference (@monji024) ",
+            " peek v2.0.0 — Keyboard Reference (@monji024) ",
             Style::default()
                 .fg(Color::White)
+                .bg(pal.bg_status_top)
                 .add_modifier(Modifier::BOLD),
         )]))
         .borders(Borders::ALL)
-        .border_type(app.theme_mode.border_type())
+        .border_type(pal.mode.border_type())
         .border_style(Style::default().fg(pal.border_active))
         .style(Style::default().bg(pal.bg_modal));
 
@@ -994,8 +1083,8 @@ pub fn render_help_modal(f: &mut Frame, app: &App) {
         ("x", "Toggle automatic pause on non-zero exit code ($? != 0)"),
         ("P (Shift+p)", "Cycle active Bash process and inspect process tree"),
         ("d / D", "Capture directory snapshot & diff / Set snapshot scope"),
-        ("v", "Switch bottom pane between Console, Events, and Snapshots"),
-        ("t", "Cycle visual theme (Classic, Luna Blue, Terminal Native)"),
+        ("v", "Switch bottom pane (Console, Events, Snapshots, Diagnostics)"),
+        ("t", "Cycle visual theme (Luna Blue XP, Classic, Terminal Native)"),
         ("M (Shift+m)", "Toggle automatic credential & secret value redaction"),
         ("h", "Toggle system environment variables ([env]) visibility"),
         ("Enter", "Open multiline value & old/new diff inspector modal"),
@@ -1003,7 +1092,7 @@ pub fn render_help_modal(f: &mut Frame, app: &App) {
         ("i", "Send a line of text to script standard input (read)"),
         ("/ and w", "Filter variables / Pin variable to watchpoint list"),
         ("f / N / g", "Find text in source / Next match / Goto line number"),
-        ("p / r / q", "Export report / Restart session / Quit debugger"),
+        ("p / r / q / Q", "Export report / Restart / Quit or detach / Kill remote"),
     ];
 
     let lines: Vec<Line> = rows
@@ -1013,7 +1102,7 @@ pub fn render_help_modal(f: &mut Frame, app: &App) {
                 Span::styled(
                     format!("  {:<18}", k),
                     Style::default()
-                        .fg(Color::LightCyan)
+                        .fg(Color::LightYellow)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(desc, Style::default().fg(pal.syn_text)),

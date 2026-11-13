@@ -1,5 +1,6 @@
 // https://github.com/monji024
 
+mod analyzer;
 mod app;
 mod engine;
 mod keymap;
@@ -42,8 +43,8 @@ use ui::theme::ThemeMode;
 #[command(
     name = "peek",
     author = "monji024 (https://github.com/monji024)",
-    version = "1.1.0",
-    about = "Interactive TUI debugger, profiler & time-travel inspector for Bash scripts",
+    version = "2.0.0",
+    about = "Interactive TUI debugger, profiler, static analyzer & time-travel inspector for Bash scripts",
     after_help = "https://github.com/monji024/peek"
 )]
 struct Cli {
@@ -98,8 +99,8 @@ struct Cli {
 
     #[arg(
         long = "theme",
-        default_value = "classic",
-        help = "Visual theme mode: classic, luna-blue, or terminal-native"
+        default_value = "luna-blue",
+        help = "Visual theme mode: luna-blue, classic, or terminal-native"
     )]
     theme: String,
 
@@ -125,9 +126,12 @@ fn main() -> Result<()> {
         if sessions.is_empty() {
             println!("No active peek debugging sessions ({} stale cleaned).", removed);
         } else {
-            println!("SESSION ID           PID      SCRIPT");
+            println!("SESSION ID           HOST PID   BASH PID   SCRIPT");
             for s in sessions {
-                println!("{:<20} {:<8} {}", s.session_id, s.root_pid, s.entry_script);
+                println!(
+                    "{:<20} {:<10} {:<10} {}",
+                    s.session_id, s.host_pid, s.root_pid, s.entry_script
+                );
             }
         }
         return Ok(());
